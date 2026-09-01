@@ -61,6 +61,15 @@ _BOT_CONFIRM_PHRASES = [
     "total cost of execution",
 ]
 
+# Transient server-side errors from the bot — keep the job alive, don't reject
+_BOT_TRANSIENT_PHRASES = [
+    "unable to contact external server",
+    "it's probably rebooting",
+    "wait a few minutes",
+    "expected duration of one reboot",
+    "current reboot lasts",
+]
+
 # ---------------------------------------------------------------------------
 # Phone normalisation
 # ---------------------------------------------------------------------------
@@ -104,10 +113,15 @@ def _new_job(phone_count: int) -> str:
         "result_bytes": None,   # raw bytes returned by the bot (JSON or ZIP)
         "result_type": None,    # "json" | "zip" | "unknown"
         "created_at": time.time(),
-        "confirmed": False,     # True once we clicked the bot's Confirm button
-        "recoverable": False,   # True if failure happened after bot produced results
-        "bot_username": None,   # set on recoverable failure for admin recovery
-        "failed_at": None,      # epoch seconds when failure was detected
+        "confirmed": False,          # True once we clicked the bot's Confirm button
+        "recoverable": False,        # True if failure happened after bot produced results
+        "bot_username": None,        # set on recoverable failure for admin recovery
+        "failed_at": None,           # epoch seconds when failure was detected
+        "estimated_cost_usd": None,  # parsed from bot's cost-of-execution confirmation
+        "hit_count": None,           # phones with any data found
+        "total_searched": None,      # phones actually searched (from bot progress)
+        "balance_available": None,   # set on balance-exhaustion rejection
+        "balance_required": None,    # set on balance-exhaustion rejection
     }
     return job_id
 
@@ -119,6 +133,27 @@ def get_job(job_id: str) -> Optional[dict]:
 def clear_job(job_id: str) -> bool:
     """Remove a job from the store. Returns True if it existed."""
     return jobs.pop(job_id, None) is not None
+
+
+def _emit_job_audit(job_id: str, job: dict, start_t: float) -> None:
+    """Emit a single structured AUDIT line on every job exit (success or failure)."""
+    phone_count = job.get("phone_count", 0)
+    hit_count = job.get("hit_count")
+    hit_pct = (
+        f"{100.0 * hit_count / phone_count:.1f}%"
+        if hit_count is not None and phone_count > 0
+        else None
+    )
+    result_bytes = job.get("result_bytes")
+    logger.info(
+        "AUDIT job_id=%s status=%s phones=%d hits=%s pct=%s "
+        "est_cost_usd=%s result_kb=%s bal_avail=%s bal_req=%s elapsed_sec=%.1f",
+        job_id, job.get("status"), phone_count, hit_count, hit_pct,
+        job.get("estimated_cost_usd"),
+        f"{len(result_bytes) // 1024}" if result_bytes else None,
+        job.get("balance_available"), job.get("balance_required"),
+        time.time() - start_t,
+    )
 
 
 def is_busy() -> Optional[dict]:
@@ -279,7 +314,14 @@ async def _worker_loop():
 
 async def _process_job(job_id: str, phones: list[str]):
     job = jobs[job_id]
+    _audit_start = time.time()
+    try:
+        await _process_job_inner(job_id, phones, job)
+    finally:
+        _emit_job_audit(job_id, job, _audit_start)
 
+
+async def _process_job_inner(job_id: str, phones: list[str], job: dict):
     # Enforce bot minimum before even sending
     if len(phones) < BOT_MIN_PHONES:
         job["status"] = "failed"
@@ -402,6 +444,24 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
 
         # --- Stage 1: not yet confirmed — look for Confirm button ---
         if not confirmed:
+            # Parse cost estimate from the bot's pre-confirmation message
+            cost_m = re.search(r"total cost of execution[:\s]*(\d+\.?\d*)\$", text_lower)
+            if cost_m:
+                job["estimated_cost_usd"] = float(cost_m.group(1))
+
+            # Parse balance fields emitted on balance-exhaustion rejection
+            bal_m = re.search(r"available balance[:\s]*(\d+\.?\d*)\$", text_lower)
+            req_m = re.search(r"required balance[:\s]*(\d+\.?\d*)\$", text_lower)
+            if bal_m:
+                job["balance_available"] = float(bal_m.group(1))
+            if req_m:
+                job["balance_required"] = float(req_m.group(1))
+
+            # Transient server error — keep waiting, bot will recover on its own
+            if any(phrase in text_lower for phrase in _BOT_TRANSIENT_PHRASES):
+                logger.warning("[%s] transient bot error (server rebooting?) — keeping job alive", job_id)
+                return
+
             confirm_btn = next(
                 (b for b in all_buttons if b.text and "confirm" in b.text.lower()), None
             )
@@ -419,14 +479,31 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
                     logger.warning("[%s] Confirm click failed: %s", job_id, e)
                     reply_future.set_result(("rejected", f"Could not click Confirm: {e}"))
             elif all_buttons:
-                logger.warning("[%s] no Confirm button — rejection: %s", job_id, button_texts)
-                reply_future.set_result(("rejected", event.text))
+                # Only reject if there's a genuine rejection signal — a payment/balance
+                # button or a known rejection phrase. Unsolicited account-info pages
+                # (e.g. /info response with Back + Update buttons) are noise from stale
+                # bot state and should be ignored so the job stays alive.
+                has_rejection_btn = any(
+                    b.text and any(kw in b.text.lower() for kw in ["fill", "balance", "payment", "💳"])
+                    for b in all_buttons
+                )
+                if has_rejection_btn or any(phrase in text_lower for phrase in _BOT_REJECTION_PHRASES):
+                    logger.warning("[%s] no Confirm button — rejection: %s", job_id, button_texts)
+                    reply_future.set_result(("rejected", event.text))
+                else:
+                    logger.info("[%s] ignoring unexpected buttons (not a rejection): %s", job_id, button_texts)
             else:
                 if any(phrase in text_lower for phrase in _BOT_REJECTION_PHRASES):
                     reply_future.set_result(("rejected", event.text))
             return
 
         # --- Stage 2: confirmed — look for Download Results button (new or edited message) ---
+        # Parse hit/total from bot progress messages ("The percentage of the found: 1510/6279")
+        pct_m = re.search(r"percentage of the found[:\s]*(\d+)/(\d+)", text_lower)
+        if pct_m:
+            job["hit_count"] = int(pct_m.group(1))
+            job["total_searched"] = int(pct_m.group(2))
+
         download_btn = next(
             (b for b in all_buttons if b.text and "download" in b.text.lower()), None
         )

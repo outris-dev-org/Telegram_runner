@@ -178,8 +178,13 @@ async def get_job_status(job_id: str):
         "phone_count": job["phone_count"],
         "message": job["message"],
         "error": job["error"],
-        "result_type": job.get("result_type"),  # "json" | "zip" | "unknown" | null (while running)
+        "result_type": job.get("result_type"),
         "recoverable": job.get("recoverable", False),
+        "estimated_cost_usd": job.get("estimated_cost_usd"),
+        "hit_count": job.get("hit_count"),
+        "total_searched": job.get("total_searched"),
+        "balance_available": job.get("balance_available"),
+        "balance_required": job.get("balance_required"),
     }
 
 
