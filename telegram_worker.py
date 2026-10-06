@@ -187,6 +187,54 @@ class ServiceBusyError(Exception):
 # ---------------------------------------------------------------------------
 _job_queue: asyncio.Queue = asyncio.Queue()
 _client: Optional[TelegramClient] = None
+_reconnect_lock = asyncio.Lock()
+
+
+def is_client_connected() -> bool:
+    """Return True if Telethon client exists and is actively connected."""
+    return _client is not None and _client.is_connected()
+
+
+async def ensure_connected() -> bool:
+    """Ensure the Telethon client is connected and authorised; reconnect if dropped."""
+    global _client
+    if _client is None:
+        raise RuntimeError("Telegram client is not initialised")
+
+    if _client.is_connected():
+        return True
+
+    async with _reconnect_lock:
+        if _client.is_connected():
+            return True
+
+        logger.warning("Telegram client disconnected — attempting auto-reconnect...")
+        try:
+            await _client.connect()
+            if not await _client.is_user_authorized():
+                raise RuntimeError(
+                    "Telegram session string is invalid or expired. "
+                    "Re-run auth.py locally to generate a fresh session string."
+                )
+            me = await _client.get_me()
+            logger.info("Telegram client reconnected successfully as %s (id=%s)", me.username, me.id)
+            return True
+        except Exception as exc:
+            logger.error("Auto-reconnect failed: %s: %s", type(exc).__name__, exc)
+            raise
+
+
+async def _watchdog_loop():
+    """Periodic keepalive watchdog to recover from silent MTProto drops."""
+    logger.info("Watchdog loop started (interval=45s)")
+    while True:
+        await asyncio.sleep(45)
+        try:
+            if _client is not None and not _client.is_connected():
+                logger.warning("[watchdog] Detected disconnected Telethon client; triggering auto-reconnect...")
+                await ensure_connected()
+        except Exception as exc:
+            logger.warning("[watchdog] Reconnect attempt failed: %s", exc)
 
 
 async def start_worker():
@@ -208,6 +256,7 @@ async def start_worker():
     logger.info("Telegram client ready — logged in as %s (id=%s)", me.username, me.id)
 
     asyncio.create_task(_worker_loop())
+    asyncio.create_task(_watchdog_loop())
 
 
 async def stop_worker():
@@ -332,6 +381,9 @@ async def _process_job_inner(job_id: str, phones: list[str], job: dict):
         logger.warning("[%s] rejected before send — only %d phones", job_id, len(phones))
         return
 
+    # Ensure connection is active before processing
+    await ensure_connected()
+
     job["status"] = "sending"
     job["message"] = f"Sending {len(phones)} phones to bot"
     logger.info("[%s] sending %d phones to %s", job_id, len(phones), BOT_USERNAME)
@@ -403,6 +455,7 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
         asyncio.TimeoutError   — deadline exceeded
         _BotRejectedError      — bot sent a rejection text (too few lines, bad format, etc.)
     """
+    await ensure_connected()
     job = jobs[job_id]
     bot_entity = await _client.get_entity(BOT_USERNAME)
 

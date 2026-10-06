@@ -342,6 +342,12 @@ async def delete_job(job_id: str):
 
 @app.get("/health")
 async def health():
+    if not worker.is_client_connected():
+        try:
+            await worker.ensure_connected()
+        except Exception as exc:
+            logger.error("Health check failed to reconnect: %s", exc)
+            raise HTTPException(status_code=503, detail="Telegram client is disconnected")
     return {"status": "ok"}
 
 
